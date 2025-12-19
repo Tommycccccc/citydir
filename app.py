@@ -1,6 +1,12 @@
 import re
+import io
 import pandas as pd
 import streamlit as st
+
+from docx import Document
+from docx.shared import Pt
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 st.set_page_config(page_title="ELC - City Directory Search", layout="wide")
 st.title("ELC - City Directory Search")
@@ -49,7 +55,7 @@ st.markdown(
         width: 100%;
         border-collapse: collapse;
         margin-top: 6px;
-        table-layout: fixed; /* helps wrapping behave */
+        table-layout: fixed;
       }
       .neat-table th, .neat-table td {
         padding: 10px 12px;
@@ -72,17 +78,7 @@ st.markdown(
         overflow-wrap: anywhere;
       }
 
-      .section-title {
-        margin-top: 18px;
-      }
-
-      /* Optional: make the right scroll container feel like a panel */
-      .scroll-panel {
-        border: 1px solid rgba(255,255,255,.10);
-        border-radius: 12px;
-        background: rgba(255,255,255,.02);
-        padding: 10px 10px 2px 10px;
-      }
+      .section-title { margin-top: 18px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -106,6 +102,7 @@ def read_input(file) -> pd.DataFrame:
             df["ADDRESS"] = df["ADDRESS"].ffill().apply(normalize_addr)
         return df
 
+    # XLSX (requires openpyxl installed in your env/Streamlit Cloud)
     xls = pd.ExcelFile(file)
     raw = pd.read_excel(xls, sheet_name=0, header=None)
 
@@ -135,6 +132,7 @@ def read_input(file) -> pd.DataFrame:
     return df
 
 def format_year_listing(df_addr: pd.DataFrame) -> pd.DataFrame:
+    """Group by YEAR and combine listings into comma-separated unique string."""
     if "YEAR" not in df_addr.columns or "LISTING" not in df_addr.columns:
         return pd.DataFrame(columns=["Year(s)", "Occupant Listed"])
 
@@ -163,6 +161,46 @@ def format_year_listing(df_addr: pd.DataFrame) -> pd.DataFrame:
          .reset_index(drop=True)
     )
     return grouped
+
+def compress_year_runs(out_df: pd.DataFrame) -> list[tuple[str, str]]:
+    """
+    Turn:
+      1970 A
+      1971 A
+      1972 B
+    Into:
+      1970-1971 A
+      1972 B
+    """
+    if out_df.empty:
+        return []
+
+    years = out_df["Year(s)"].tolist()
+    occs = out_df["Occupant Listed"].tolist()
+
+    rows: list[tuple[str, str]] = []
+    start_y = years[0]
+    prev_y = years[0]
+    prev_occ = occs[0]
+
+    for y, occ in zip(years[1:], occs[1:]):
+        contiguous = (y == prev_y + 1)
+        same_occ = (occ == prev_occ)
+        if contiguous and same_occ:
+            prev_y = y
+            continue
+
+        # flush run
+        label = f"{start_y}-{prev_y}" if start_y != prev_y else f"{start_y}"
+        rows.append((label, prev_occ))
+        start_y = y
+        prev_y = y
+        prev_occ = occ
+
+    # final run
+    label = f"{start_y}-{prev_y}" if start_y != prev_y else f"{start_y}"
+    rows.append((label, prev_occ))
+    return rows
 
 def render_block(addr: str, kind: str, out_df: pd.DataFrame):
     st.markdown('<div class="addr-card">', unsafe_allow_html=True)
@@ -197,6 +235,108 @@ def render_block(addr: str, kind: str, out_df: pd.DataFrame):
     st.markdown(table_html, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
+# ---------- DOCX helpers ----------
+def set_cell_shading(cell, fill_hex: str):
+    """fill_hex like 'D9EAD3' (light green)."""
+    tcPr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), fill_hex)
+    tcPr.append(shd)
+
+def set_cell_bold(cell, bold=True):
+    for p in cell.paragraphs:
+        for r in p.runs:
+            r.bold = bold
+
+def set_table_header_style(table, fill_hex="D9EAD3"):
+    hdr = table.rows[0].cells
+    for c in hdr:
+        set_cell_shading(c, fill_hex)
+        set_cell_bold(c, True)
+
+def docx_bytes(doc: Document) -> bytes:
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+def build_subject_report_docx(subject_selected: list[str], df: pd.DataFrame) -> bytes:
+    """
+    Report format:
+    Year(s) | Subject Property Address(es) — Occupant Listed
+    1970    | 2365 ... — Mercury ...
+    """
+    doc = Document()
+
+    # Table with 2 columns
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+    table.autofit = True
+
+    hdr_cells = table.rows[0].cells
+    hdr_cells[0].text = "Year(s)"
+    hdr_cells[1].text = "Subject Property Address(es) — Occupant Listed"
+    set_table_header_style(table)
+
+    # build rows
+    for addr in subject_selected:
+        block = df[df["ADDRESS"] == addr].copy()
+        out = format_year_listing(block)
+        runs = compress_year_runs(out)
+
+        if not runs:
+            row = table.add_row().cells
+            row[0].text = ""
+            row[1].text = f"{addr} — No results"
+            continue
+
+        for year_label, occ in runs:
+            row = table.add_row().cells
+            row[0].text = str(year_label)
+            row[1].text = f"{addr} — {occ}"
+
+    return docx_bytes(doc)
+
+def build_adjoining_report_docx(adjoining_selected: list[str], df: pd.DataFrame, direction_map: dict) -> bytes:
+    """
+    Report format:
+    Direction | Adjoining Property Addresses | Occupant Listed (Year)
+    """
+    doc = Document()
+    doc.add_paragraph("Addresses of adjoining properties were also reviewed. Historical tenants included:")
+
+    table = doc.add_table(rows=1, cols=3)
+    table.style = "Table Grid"
+    table.autofit = True
+
+    hdr = table.rows[0].cells
+    hdr[0].text = "Direction"
+    hdr[1].text = "Adjoining Property Addresses"
+    hdr[2].text = "Occupant Listed (Year)"
+    set_table_header_style(table)
+
+    for addr in adjoining_selected:
+        block = df[df["ADDRESS"] == addr].copy()
+        out = format_year_listing(block)
+        runs = compress_year_runs(out)
+
+        direction = direction_map.get(addr, "")
+
+        # Occupant cell as multi-line: "Tenant (YYYY-YYYY)"
+        lines = []
+        for year_label, occ in runs:
+            if occ:
+                lines.append(f"{occ} ({year_label})")
+        occ_text = "\n".join(lines) if lines else "No results"
+
+        row = table.add_row().cells
+        row[0].text = direction
+        row[1].text = addr
+        row[2].text = occ_text
+
+    return docx_bytes(doc)
+
 # ---------- Upload ----------
 uploaded = st.file_uploader("Upload City Directory export (CSV or XLSX)", type=["csv", "xlsx"])
 if not uploaded:
@@ -222,12 +362,15 @@ if "run_subject" not in st.session_state:
     st.session_state["run_subject"] = False
 if "run_adjoining" not in st.session_state:
     st.session_state["run_adjoining"] = False
+if "dir_map" not in st.session_state:
+    st.session_state["dir_map"] = {}  # addr -> "North/East/South/West/"
 
 def clear_all():
     st.session_state["subject_sel"] = []
     st.session_state["adjoining_sel"] = []
     st.session_state["run_subject"] = False
     st.session_state["run_adjoining"] = False
+    st.session_state["dir_map"] = {}
 
 def set_run_subject():
     st.session_state["run_subject"] = True
@@ -256,11 +399,23 @@ out_left, out_right = st.columns(2)
 
 with out_left:
     st.markdown('<h2 class="section-title">Subject Property Tables</h2>', unsafe_allow_html=True)
+
     if st.session_state["run_subject"] and subject_selected:
+        # (A) On-page cards
         for addr in subject_selected:
             block = df[df["ADDRESS"] == addr].copy()
             out = format_year_listing(block)
             render_block(addr, "Subject Property", out)
+
+        # (B) One-click download in report-table DOCX format
+        subj_docx = build_subject_report_docx(subject_selected, df)
+        st.download_button(
+            "Download Subject Report Table (.docx)",
+            data=subj_docx,
+            file_name="ELC_Subject_Report_Table.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
     else:
         st.caption("Select a subject address and click CREATE SUBJECT PROPERTY TABLES.")
 
@@ -268,9 +423,19 @@ with out_right:
     st.markdown('<h2 class="section-title">Adjoining Property Tables</h2>', unsafe_allow_html=True)
 
     if st.session_state["run_adjoining"] and adjoining_selected:
-        # Panel wrapper (optional)
 
-        # ✅ Native Streamlit scroll area (FULL WIDTH like left)
+        # Optional direction mapping (won't change your main layout)
+        with st.expander("Optional: Set directions for adjoining addresses (North/East/South/West)", expanded=False):
+            dir_opts = ["", "North", "East", "South", "West"]
+            for a in adjoining_selected:
+                key = f"dir_{a}"
+                # initialize default
+                if a not in st.session_state["dir_map"]:
+                    st.session_state["dir_map"][a] = ""
+                picked = st.selectbox(a, dir_opts, index=dir_opts.index(st.session_state["dir_map"][a]), key=key)
+                st.session_state["dir_map"][a] = picked
+
+        # Right side scroll area (full width)
         scroll_box = st.container(height=720)
         with scroll_box:
             for addr in adjoining_selected:
@@ -278,5 +443,14 @@ with out_right:
                 out = format_year_listing(block)
                 render_block(addr, "Adjoining Property", out)
 
+        # One-click download in report-table DOCX format
+        adj_docx = build_adjoining_report_docx(adjoining_selected, df, st.session_state["dir_map"])
+        st.download_button(
+            "Download Adjoining Report Table (.docx)",
+            data=adj_docx,
+            file_name="ELC_Adjoining_Report_Table.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
     else:
         st.caption("Select adjoining addresses and click CREATE ADJOINING PROPERTY TABLES.")
