@@ -92,6 +92,41 @@ def normalize_addr(addr: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
+def parse_address_for_sort(addr: str) -> tuple[str, int, int, str]:
+    """
+    Sort key:
+      (street_name_upper, house_number_int, unit_number_int, full_addr_upper)
+
+    - street_name_upper: everything after the leading house number and optional unit (#)
+    - house_number_int: leading number if present, else 0
+    - unit_number_int: #N if present, else 0
+    - full_addr_upper: stable tie-breaker
+    """
+    if addr is None:
+        return ("", 0, 0, "")
+
+    a = normalize_addr(str(addr))
+    a_up = a.upper()
+
+    # house number (leading digits)
+    m_house = re.match(r"^\s*(\d+)", a_up)
+    house = int(m_house.group(1)) if m_house else 0
+
+    # unit number like "#3"
+    m_unit = re.search(r"#\s*(\d+)", a_up)
+    unit = int(m_unit.group(1)) if m_unit else 0
+
+    # remove leading house number + space
+    rest = re.sub(r"^\s*\d+\s*", "", a_up)
+
+    # remove unit marker(s) like "#3" anywhere
+    rest = re.sub(r"\s*#\s*\d+\s*", " ", rest)
+
+    # normalize spaces -> street name key
+    street = re.sub(r"\s+", " ", rest).strip()
+
+    return (street, house, unit, a_up)
+
 def read_input(file) -> pd.DataFrame:
     name = file.name.lower()
 
@@ -190,14 +225,12 @@ def compress_year_runs(out_df: pd.DataFrame) -> list[tuple[str, str]]:
             prev_y = y
             continue
 
-        # flush run
         label = f"{start_y}-{prev_y}" if start_y != prev_y else f"{start_y}"
         rows.append((label, prev_occ))
         start_y = y
         prev_y = y
         prev_occ = occ
 
-    # final run
     label = f"{start_y}-{prev_y}" if start_y != prev_y else f"{start_y}"
     rows.append((label, prev_occ))
     return rows
@@ -262,14 +295,8 @@ def docx_bytes(doc: Document) -> bytes:
     return buf.getvalue()
 
 def build_subject_report_docx(subject_selected: list[str], df: pd.DataFrame) -> bytes:
-    """
-    Report format:
-    Year(s) | Subject Property Address(es) — Occupant Listed
-    1970    | 2365 ... — Mercury ...
-    """
     doc = Document()
 
-    # Table with 2 columns
     table = doc.add_table(rows=1, cols=2)
     table.style = "Table Grid"
     table.autofit = True
@@ -279,7 +306,6 @@ def build_subject_report_docx(subject_selected: list[str], df: pd.DataFrame) -> 
     hdr_cells[1].text = "Subject Property Address(es) — Occupant Listed"
     set_table_header_style(table)
 
-    # build rows
     for addr in subject_selected:
         block = df[df["ADDRESS"] == addr].copy()
         out = format_year_listing(block)
@@ -299,10 +325,6 @@ def build_subject_report_docx(subject_selected: list[str], df: pd.DataFrame) -> 
     return docx_bytes(doc)
 
 def build_adjoining_report_docx(adjoining_selected: list[str], df: pd.DataFrame, direction_map: dict) -> bytes:
-    """
-    Report format:
-    Direction | Adjoining Property Addresses | Occupant Listed (Year)
-    """
     doc = Document()
     doc.add_paragraph("Addresses of adjoining properties were also reviewed. Historical tenants included:")
 
@@ -323,7 +345,6 @@ def build_adjoining_report_docx(adjoining_selected: list[str], df: pd.DataFrame,
 
         direction = direction_map.get(addr, "")
 
-        # Occupant cell as multi-line: "Tenant (YYYY-YYYY)"
         lines = []
         for year_label, occ in runs:
             if occ:
@@ -350,7 +371,11 @@ if "ADDRESS" not in df.columns:
     st.stop()
 
 df["ADDRESS"] = df["ADDRESS"].apply(normalize_addr)
-all_addresses = sorted([a for a in df["ADDRESS"].dropna().unique() if a.strip()])
+
+# ✅ UPDATED SORTING: street name alpha, then house number numeric, then unit numeric
+all_addresses = [a for a in df["ADDRESS"].dropna().unique() if str(a).strip()]
+all_addresses = sorted(all_addresses, key=parse_address_for_sort)
+
 st.success(f"Loaded {len(df):,} rows • Found {len(all_addresses):,} unique addresses")
 
 # ---------- Session state + callbacks ----------
@@ -363,7 +388,7 @@ if "run_subject" not in st.session_state:
 if "run_adjoining" not in st.session_state:
     st.session_state["run_adjoining"] = False
 if "dir_map" not in st.session_state:
-    st.session_state["dir_map"] = {}  # addr -> "North/East/South/West/"
+    st.session_state["dir_map"] = {}
 
 def clear_all():
     st.session_state["subject_sel"] = []
@@ -401,13 +426,11 @@ with out_left:
     st.markdown('<h2 class="section-title">Subject Property Tables</h2>', unsafe_allow_html=True)
 
     if st.session_state["run_subject"] and subject_selected:
-        # (A) On-page cards
         for addr in subject_selected:
             block = df[df["ADDRESS"] == addr].copy()
             out = format_year_listing(block)
             render_block(addr, "Subject Property", out)
 
-        # (B) One-click download in report-table DOCX format
         subj_docx = build_subject_report_docx(subject_selected, df)
         st.download_button(
             "Download Subject Report Table (.docx)",
@@ -424,18 +447,15 @@ with out_right:
 
     if st.session_state["run_adjoining"] and adjoining_selected:
 
-        # Optional direction mapping (won't change your main layout)
         with st.expander("Optional: Set directions for adjoining addresses (North/East/South/West)", expanded=False):
             dir_opts = ["", "North", "East", "South", "West"]
             for a in adjoining_selected:
                 key = f"dir_{a}"
-                # initialize default
                 if a not in st.session_state["dir_map"]:
                     st.session_state["dir_map"][a] = ""
                 picked = st.selectbox(a, dir_opts, index=dir_opts.index(st.session_state["dir_map"][a]), key=key)
                 st.session_state["dir_map"][a] = picked
 
-        # Right side scroll area (full width)
         scroll_box = st.container(height=720)
         with scroll_box:
             for addr in adjoining_selected:
@@ -443,7 +463,6 @@ with out_right:
                 out = format_year_listing(block)
                 render_block(addr, "Adjoining Property", out)
 
-        # One-click download in report-table DOCX format
         adj_docx = build_adjoining_report_docx(adjoining_selected, df, st.session_state["dir_map"])
         st.download_button(
             "Download Adjoining Report Table (.docx)",
