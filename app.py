@@ -127,6 +127,99 @@ def parse_address_for_sort(addr: str) -> tuple[str, int, int, str]:
 
     return (street, house, unit, a_up)
 
+def find_and_combine_address_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Find address column(s) and combine them into a single ADDRESS column.
+    Handles:
+    - Single ADDRESS column
+    - ADDRESS1 + ADDRESS2 columns
+    - Other address column variations
+    """
+    cols_upper = {col.upper(): col for col in df.columns}
+    
+    # Pattern 1: Single ADDRESS column exists
+    if "ADDRESS" in cols_upper:
+        df["ADDRESS"] = df[cols_upper["ADDRESS"]].apply(normalize_addr)
+        return df
+    
+    # Pattern 2: ADDRESS1 and ADDRESS2 columns (combine them)
+    if "ADDRESS1" in cols_upper and "ADDRESS2" in cols_upper:
+        addr1_col = cols_upper["ADDRESS1"]
+        addr2_col = cols_upper["ADDRESS2"]
+        
+        def combine_addresses(row):
+            a1 = str(row[addr1_col]).strip() if pd.notna(row[addr1_col]) else ""
+            a2 = str(row[addr2_col]).strip() if pd.notna(row[addr2_col]) else ""
+            
+            # Combine with a space, remove extra spaces
+            combined = f"{a1} {a2}".strip()
+            return normalize_addr(combined)
+        
+        df["ADDRESS"] = df.apply(combine_addresses, axis=1)
+        st.info(f"✓ Combined {addr1_col} and {addr2_col} into ADDRESS column")
+        return df
+    
+    # Pattern 3: Only ADDRESS1 exists (use it)
+    if "ADDRESS1" in cols_upper:
+        df["ADDRESS"] = df[cols_upper["ADDRESS1"]].apply(normalize_addr)
+        st.info(f"✓ Using {cols_upper['ADDRESS1']} as ADDRESS column")
+        return df
+    
+    # Pattern 4: Look for other common patterns
+    address_patterns = [
+        "STREET ADDRESS", "STREET_ADDRESS", "PROPERTY ADDRESS", 
+        "PROPERTY_ADDRESS", "SITE ADDRESS", "LOCATION", "STREET", "ADDR"
+    ]
+    
+    for pattern in address_patterns:
+        if pattern in cols_upper:
+            df["ADDRESS"] = df[cols_upper[pattern]].apply(normalize_addr)
+            st.info(f"✓ Using {cols_upper[pattern]} as ADDRESS column")
+            return df
+    
+    # No address column found
+    return df
+
+def find_listing_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Find the occupant/listing column and standardize it to LISTING.
+    Handles:
+    - LISTING column (ERIS format)
+    - COMPANY_NAME column (other formats)
+    - FACILITY_ID, OCCUPANT, TENANT, BUSINESS_NAME, etc.
+    """
+    cols_upper = {col.upper(): col for col in df.columns}
+    
+    # Pattern 1: LISTING already exists
+    if "LISTING" in cols_upper:
+        return df
+    
+    # Pattern 2: COMPANY_NAME (most common alternative)
+    if "COMPANY_NAME" in cols_upper:
+        df["LISTING"] = df[cols_upper["COMPANY_NAME"]]
+        st.info(f"✓ Using {cols_upper['COMPANY_NAME']} as LISTING column")
+        return df
+    
+    # Pattern 3: Other common patterns
+    listing_patterns = [
+        "FACILITY_ID",
+        "OCCUPANT",
+        "TENANT",
+        "BUSINESS_NAME",
+        "BUSINESS",
+        "COMPANY",
+        "NAME",
+        "OCCUPANT_NAME"
+    ]
+    
+    for pattern in listing_patterns:
+        if pattern in cols_upper:
+            df["LISTING"] = df[cols_upper[pattern]]
+            st.info(f"✓ Using {cols_upper[pattern]} as LISTING column")
+            return df
+    
+    return df
+
 def read_input(file) -> pd.DataFrame:
     name = file.name.lower()
 
@@ -137,16 +230,25 @@ def read_input(file) -> pd.DataFrame:
             df["ADDRESS"] = df["ADDRESS"].ffill().apply(normalize_addr)
         return df
 
-    # XLSX (requires openpyxl installed in your env/Streamlit Cloud)
+    # XLSX/XLS (requires openpyxl for .xlsx and xlrd for .xls)
     xls = pd.ExcelFile(file)
     raw = pd.read_excel(xls, sheet_name=0, header=None)
 
     header_row = None
+    # First try to find ADDRESS + YEAR (ERIS format)
     for i in range(min(50, len(raw))):
         row_vals = raw.iloc[i].astype(str).str.upper().tolist()
         if "ADDRESS" in row_vals and "YEAR" in row_vals:
             header_row = i
             break
+    
+    # If not found, look for ADDRESS1 or COMPANY_NAME (other formats)
+    if header_row is None:
+        for i in range(min(50, len(raw))):
+            row_vals = raw.iloc[i].astype(str).str.upper().tolist()
+            if ("ADDRESS1" in row_vals or "COMPANY_NAME" in row_vals):
+                header_row = i
+                break
 
     if header_row is None:
         df = pd.read_excel(xls, sheet_name=0)
@@ -158,6 +260,7 @@ def read_input(file) -> pd.DataFrame:
     df = pd.read_excel(xls, sheet_name=0, header=header_row)
     df.columns = [str(c).strip().upper() for c in df.columns]
 
+    # Only filter by YEAR if the column exists
     if "YEAR" in df.columns:
         df = df[df["YEAR"].notna()]
 
@@ -168,7 +271,30 @@ def read_input(file) -> pd.DataFrame:
 
 def format_year_listing(df_addr: pd.DataFrame) -> pd.DataFrame:
     """Group by YEAR and combine listings into comma-separated unique string."""
-    if "YEAR" not in df_addr.columns or "LISTING" not in df_addr.columns:
+    
+    # Check if YEAR column exists
+    has_year = "YEAR" in df_addr.columns
+    
+    if not has_year and "LISTING" not in df_addr.columns:
+        return pd.DataFrame(columns=["Year(s)", "Occupant Listed"])
+    
+    # Format WITHOUT year data
+    if not has_year:
+        t = df_addr[["LISTING"]].copy()
+        t["LISTING"] = t["LISTING"].astype(str).str.strip()
+        t = t[t["LISTING"].str.len() > 0]
+        
+        # Remove duplicates
+        unique_listings = t["LISTING"].drop_duplicates().tolist()
+        
+        result = pd.DataFrame({
+            "Year(s)": ["N/A"] * len(unique_listings),
+            "Occupant Listed": unique_listings
+        })
+        return result
+    
+    # Format WITH year data (original logic)
+    if "LISTING" not in df_addr.columns:
         return pd.DataFrame(columns=["Year(s)", "Occupant Listed"])
 
     t = df_addr[["YEAR", "LISTING"]].copy()
@@ -212,6 +338,10 @@ def compress_year_runs(out_df: pd.DataFrame) -> list[tuple[str, str]]:
 
     years = out_df["Year(s)"].tolist()
     occs = out_df["Occupant Listed"].tolist()
+    
+    # If no year data (all "N/A"), just return the listings
+    if all(str(y) == "N/A" for y in years):
+        return [(y, occ) for y, occ in zip(years, occs)]
 
     rows: list[tuple[str, str]] = []
     start_y = years[0]
@@ -366,11 +496,25 @@ if not uploaded:
 df = read_input(uploaded)
 df.columns = [c.upper() for c in df.columns]
 
+# Find and combine address columns
+df = find_and_combine_address_columns(df)
+
 if "ADDRESS" not in df.columns:
-    st.error("Could not find an ADDRESS column. If your file uses a different column name, tell me what it is.")
+    st.error("❌ Could not find an ADDRESS column. Available columns: " + ", ".join(df.columns))
+    st.info("Looking for: ADDRESS, ADDRESS1/ADDRESS2, STREET ADDRESS, PROPERTY ADDRESS, etc.")
     st.stop()
 
-df["ADDRESS"] = df["ADDRESS"].apply(normalize_addr)
+# Find and standardize listing/occupant column
+df = find_listing_column(df)
+
+if "LISTING" not in df.columns:
+    st.error("❌ Could not find a LISTING/COMPANY_NAME column. Available columns: " + ", ".join(df.columns))
+    st.info("Looking for: LISTING, COMPANY_NAME, FACILITY_ID, OCCUPANT, TENANT, etc.")
+    st.stop()
+
+# Check if YEAR column exists and warn user
+if "YEAR" not in df.columns:
+    st.warning("⚠️ No YEAR column found in this file. Results will show occupants without year information.")
 
 # ✅ UPDATED SORTING: street name alpha, then house number numeric, then unit numeric
 all_addresses = [a for a in df["ADDRESS"].dropna().unique() if str(a).strip()]
