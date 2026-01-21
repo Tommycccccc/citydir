@@ -359,7 +359,7 @@ def build_adjoining_report_docx(adjoining_selected: list[str], df: pd.DataFrame,
     return docx_bytes(doc)
 
 # ---------- Upload ----------
-uploaded = st.file_uploader("Upload City Directory export (CSV or XLSX)", type=["csv", "xlsx"])
+uploaded = st.file_uploader("Upload City Directory export (CSV, XLSX, or XLS)", type=["csv", "xlsx", "xls"])
 if not uploaded:
     st.stop()
 
