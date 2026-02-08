@@ -235,8 +235,196 @@ def find_listing_column(df: pd.DataFrame) -> pd.DataFrame:
     
     return df
 
+# ---------- PDF PROCESSING ----------
+
+def preprocess_image_for_ocr(image):
+    """
+    Improve image quality for OCR
+    """
+    try:
+        from PIL import ImageEnhance, ImageFilter
+        
+        # Convert to grayscale
+        image = image.convert('L')
+        
+        # Increase contrast
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(2.0)
+        
+        # Sharpen
+        image = image.filter(ImageFilter.SHARPEN)
+        
+        # Threshold to binary
+        image = image.point(lambda x: 0 if x < 140 else 255, '1')
+        
+        return image
+    except Exception as e:
+        st.warning(f"Image preprocessing failed: {e}")
+        return image
+
+def parse_text_directory(text: str) -> list:
+    """
+    Parse city directory text into structured records
+    Handles both EDR and Polk's formats
+    """
+    records = []
+    lines = text.split('\n')
+    
+    current_street = None
+    current_year = None
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Detect year (4-digit year anywhere in line)
+        year_match = re.search(r'\b(19\d{2}|20\d{2})\b', line)
+        if year_match:
+            current_year = year_match.group()
+        
+        # Detect street name (various patterns)
+        street_patterns = [
+            r'([A-Z\s]+(?:BLVD|HWY|HIGHWAY|ST|STREET|RD|ROAD|AVE|AVENUE|DRIVE|DR|LANE|LN|WAY|PKWY|PARKWAY))',
+            r'(US HWY \d+[A-Z\s]*)',
+            r'(SUN[\'N\s]+LAKE BLVD)',
+            r'([NS]?\s*BARFIELD\s+HW?Y?)',
+            r'([NSEW]?\s*\d+(?:ST|ND|RD|TH)\s+ST)',
+        ]
+        
+        for pattern in street_patterns:
+            street_match = re.search(pattern, line, re.IGNORECASE)
+            if street_match:
+                potential_street = street_match.group(1).strip()
+                # Only update if it looks like a street (not just "ST" from "State")
+                if len(potential_street) > 3:
+                    current_street = potential_street
+                    break
+        
+        # Parse address entries
+        # Pattern: "4002 State Farm Insurance 385-3313" or "372 OASIS TREE FARM"
+        addr_pattern = r'^(\d{3,5})[a-z]?\s+(.+?)(?:\s+\d{3}-\d{4})?$'
+        addr_match = re.match(addr_pattern, line, re.IGNORECASE)
+        
+        if addr_match and current_street:
+            address_num = addr_match.group(1)
+            occupant = addr_match.group(2).strip()
+            
+            # Clean up occupant name
+            occupant = re.sub(r'\s+\d{3}-\d{4}$', '', occupant)  # Remove phone
+            occupant = re.sub(r'\s+$', '', occupant)  # Trim trailing spaces
+            
+            # Skip if occupant is too short (likely parsing error)
+            if len(occupant) < 2:
+                continue
+            
+            records.append({
+                'ADDRESS': f"{address_num} {current_street}",
+                'LISTING': occupant,
+                'YEAR': int(current_year) if current_year else None
+            })
+    
+    return records
+
+def read_pdf_input(file) -> pd.DataFrame:
+    """
+    Extract city directory data from PDF (both text-based and scanned)
+    """
+    import pdfplumber
+    
+    records = []
+    
+    # Try text extraction first (for EDR-style PDFs)
+    try:
+        with pdfplumber.open(file) as pdf:
+            text_content = ""
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text and len(page_text.strip()) > 100:
+                    text_content += page_text + "\n"
+            
+            # If we got substantial text, parse it
+            if len(text_content) > 500:
+                st.info("📄 Extracting text from PDF...")
+                records = parse_text_directory(text_content)
+                if records:
+                    df = pd.DataFrame(records)
+                    df['ADDRESS'] = df['ADDRESS'].apply(normalize_addr)
+                    st.success(f"✅ Extracted {len(records)} entries from text-based PDF")
+                    return df
+    except Exception as e:
+        st.warning(f"Text extraction failed: {e}")
+    
+    # Fall back to OCR for scanned PDFs
+    st.info("📸 This appears to be a scanned PDF. Using OCR to extract text...")
+    st.caption("⏳ This may take 1-2 minutes depending on PDF size...")
+    
+    try:
+        import pytesseract
+        from pdf2image import convert_from_bytes
+        from PIL import Image
+    except ImportError:
+        st.error("❌ OCR libraries not installed. Please install: pytesseract, pdf2image, Pillow")
+        st.info("💡 For text-based PDFs only, OCR is not required.")
+        st.stop()
+    
+    file.seek(0)  # Reset file pointer
+    pdf_bytes = file.read()
+    
+    # Convert PDF pages to images
+    try:
+        images = convert_from_bytes(pdf_bytes, dpi=300)
+    except Exception as e:
+        st.error(f"❌ Failed to convert PDF to images: {e}")
+        st.info("💡 Make sure poppler-utils is installed on your system")
+        st.stop()
+    
+    all_text = ""
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, image in enumerate(images):
+        status_text.text(f"Processing page {i + 1}/{len(images)}...")
+        
+        # Preprocess image for better OCR
+        image = preprocess_image_for_ocr(image)
+        
+        # Extract text with OCR
+        try:
+            page_text = pytesseract.image_to_string(image, config='--psm 6')
+            all_text += page_text + "\n"
+        except Exception as e:
+            st.warning(f"OCR failed on page {i + 1}: {e}")
+        
+        progress_bar.progress((i + 1) / len(images))
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    # Parse the OCR'd text
+    records = parse_text_directory(all_text)
+    
+    if not records:
+        st.error("❌ Could not extract city directory data from PDF.")
+        st.info("💡 **Troubleshooting:**\n"
+                "- Ensure the PDF contains tabular city directory data\n"
+                "- Check that text is readable (not too faded)\n"
+                "- Try converting PDF to Excel manually if OCR fails")
+        st.stop()
+    
+    df = pd.DataFrame(records)
+    df['ADDRESS'] = df['ADDRESS'].apply(normalize_addr)
+    st.success(f"✅ Extracted {len(records)} entries using OCR")
+    
+    return df
+
+
 def read_input(file) -> pd.DataFrame:
     name = file.name.lower()
+
+    # PDF SUPPORT
+    if name.endswith(".pdf"):
+        return read_pdf_input(file)
 
     if name.endswith(".csv"):
         df = pd.read_csv(file)
@@ -533,7 +721,10 @@ def build_adjoining_report_docx(adjoining_selected: list[str], df: pd.DataFrame,
     return docx_bytes(doc)
 
 # ---------- Upload ----------
-uploaded = st.file_uploader("Upload City Directory export (CSV, XLSX, or XLS)", type=["csv", "xlsx", "xls"])
+uploaded = st.file_uploader(
+    "Upload City Directory export (CSV, XLSX, XLS, or PDF)", 
+    type=["csv", "xlsx", "xls", "pdf"]
+)
 if not uploaded:
     st.stop()
 
@@ -565,6 +756,12 @@ all_addresses = [a for a in df["ADDRESS"].dropna().unique() if str(a).strip()]
 all_addresses = sorted(all_addresses, key=parse_address_for_sort)
 
 st.success(f"Loaded {len(df):,} rows • Found {len(all_addresses):,} unique addresses")
+
+# Show preview of extracted data if PDF
+if uploaded.name.lower().endswith('.pdf'):
+    with st.expander("📄 Preview Extracted PDF Data"):
+        st.dataframe(df.head(50))
+        st.caption(f"Showing first 50 of {len(df)} rows")
 
 # ---------- Session state + callbacks ----------
 if "subject_sel" not in st.session_state:
