@@ -148,50 +148,66 @@ def find_and_combine_address_columns(df: pd.DataFrame) -> pd.DataFrame:
     Handles:
     - Single ADDRESS column
     - ADDRESS1 + ADDRESS2 columns
+    - STREET NO + STREET NAME columns (TP/ADJ format)
     - Other address column variations
     """
     cols_upper = {col.upper(): col for col in df.columns}
-    
+
     # Pattern 1: Single ADDRESS column exists
     if "ADDRESS" in cols_upper:
         df["ADDRESS"] = df[cols_upper["ADDRESS"]].apply(normalize_addr)
         return df
-    
+
     # Pattern 2: ADDRESS1 and ADDRESS2 columns (combine them)
     if "ADDRESS1" in cols_upper and "ADDRESS2" in cols_upper:
         addr1_col = cols_upper["ADDRESS1"]
         addr2_col = cols_upper["ADDRESS2"]
-        
+
         def combine_addresses(row):
             a1 = str(row[addr1_col]).strip() if pd.notna(row[addr1_col]) else ""
             a2 = str(row[addr2_col]).strip() if pd.notna(row[addr2_col]) else ""
-            
-            # Combine with a space, remove extra spaces
             combined = f"{a1} {a2}".strip()
             return normalize_addr(combined)
-        
+
         df["ADDRESS"] = df.apply(combine_addresses, axis=1)
         st.info(f"✓ Combined {addr1_col} and {addr2_col} into ADDRESS column")
         return df
-    
+
     # Pattern 3: Only ADDRESS1 exists (use it)
     if "ADDRESS1" in cols_upper:
         df["ADDRESS"] = df[cols_upper["ADDRESS1"]].apply(normalize_addr)
         st.info(f"✓ Using {cols_upper['ADDRESS1']} as ADDRESS column")
         return df
-    
-    # Pattern 4: Look for other common patterns
+
+    # Pattern 4: STREET NO + STREET NAME columns (TP/ADJ format)
+    if "STREET NO" in cols_upper and "STREET NAME" in cols_upper:
+        sno_col = cols_upper["STREET NO"]
+        sname_col = cols_upper["STREET NAME"]
+
+        def combine_street_no_name(row):
+            sno = str(row[sno_col]).strip() if pd.notna(row[sno_col]) else ""
+            sname = str(row[sname_col]).strip() if pd.notna(row[sname_col]) else ""
+            # Remove trailing .0 from numeric street numbers read as float by pandas
+            sno = re.sub(r'\.0$', '', sno)
+            combined = f"{sno} {sname}".strip()
+            return normalize_addr(combined)
+
+        df["ADDRESS"] = df.apply(combine_street_no_name, axis=1)
+        st.info(f"✓ Combined {sno_col} and {sname_col} into ADDRESS column")
+        return df
+
+    # Pattern 5: Look for other common patterns
     address_patterns = [
-        "STREET ADDRESS", "STREET_ADDRESS", "PROPERTY ADDRESS", 
+        "STREET ADDRESS", "STREET_ADDRESS", "PROPERTY ADDRESS",
         "PROPERTY_ADDRESS", "SITE ADDRESS", "LOCATION", "STREET", "ADDR"
     ]
-    
+
     for pattern in address_patterns:
         if pattern in cols_upper:
             df["ADDRESS"] = df[cols_upper[pattern]].apply(normalize_addr)
             st.info(f"✓ Using {cols_upper[pattern]} as ADDRESS column")
             return df
-    
+
     # No address column found
     return df
 
@@ -201,21 +217,28 @@ def find_listing_column(df: pd.DataFrame) -> pd.DataFrame:
     Handles:
     - LISTING column (ERIS format)
     - COMPANY_NAME column (other formats)
+    - OCCUPANT NAME column (TP/ADJ format)
     - FACILITY_ID, OCCUPANT, TENANT, BUSINESS_NAME, etc.
     """
     cols_upper = {col.upper(): col for col in df.columns}
-    
+
     # Pattern 1: LISTING already exists
     if "LISTING" in cols_upper:
         return df
-    
+
     # Pattern 2: COMPANY_NAME (most common alternative)
     if "COMPANY_NAME" in cols_upper:
         df["LISTING"] = df[cols_upper["COMPANY_NAME"]]
         st.info(f"✓ Using {cols_upper['COMPANY_NAME']} as LISTING column")
         return df
-    
-    # Pattern 3: Other common patterns
+
+    # Pattern 3: OCCUPANT NAME column (TP/ADJ format — checked before loop since it has a space)
+    if "OCCUPANT NAME" in cols_upper:
+        df["LISTING"] = df[cols_upper["OCCUPANT NAME"]]
+        st.info(f"✓ Using {cols_upper['OCCUPANT NAME']} as LISTING column")
+        return df
+
+    # Pattern 4: Other common patterns
     listing_patterns = [
         "FACILITY_ID",
         "OCCUPANT",
@@ -226,13 +249,13 @@ def find_listing_column(df: pd.DataFrame) -> pd.DataFrame:
         "NAME",
         "OCCUPANT_NAME"
     ]
-    
+
     for pattern in listing_patterns:
         if pattern in cols_upper:
             df["LISTING"] = df[cols_upper[pattern]]
             st.info(f"✓ Using {cols_upper[pattern]} as LISTING column")
             return df
-    
+
     return df
 
 # ---------- PDF PROCESSING ----------
@@ -243,20 +266,20 @@ def preprocess_image_for_ocr(image):
     """
     try:
         from PIL import ImageEnhance, ImageFilter
-        
+
         # Convert to grayscale
         image = image.convert('L')
-        
+
         # Increase contrast
         enhancer = ImageEnhance.Contrast(image)
         image = enhancer.enhance(2.0)
-        
+
         # Sharpen
         image = image.filter(ImageFilter.SHARPEN)
-        
+
         # Threshold to binary
         image = image.point(lambda x: 0 if x < 140 else 255, '1')
-        
+
         return image
     except Exception as e:
         st.warning(f"Image preprocessing failed: {e}")
@@ -269,20 +292,20 @@ def parse_text_directory(text: str) -> list:
     """
     records = []
     lines = text.split('\n')
-    
+
     current_street = None
     current_year = None
-    
+
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        
+
         # Detect year (4-digit year anywhere in line)
         year_match = re.search(r'\b(19\d{2}|20\d{2})\b', line)
         if year_match:
             current_year = year_match.group()
-        
+
         # Detect street name (various patterns)
         street_patterns = [
             r'([A-Z\s]+(?:BLVD|HWY|HIGHWAY|ST|STREET|RD|ROAD|AVE|AVENUE|DRIVE|DR|LANE|LN|WAY|PKWY|PARKWAY))',
@@ -291,7 +314,7 @@ def parse_text_directory(text: str) -> list:
             r'([NS]?\s*BARFIELD\s+HW?Y?)',
             r'([NSEW]?\s*\d+(?:ST|ND|RD|TH)\s+ST)',
         ]
-        
+
         for pattern in street_patterns:
             street_match = re.search(pattern, line, re.IGNORECASE)
             if street_match:
@@ -300,30 +323,30 @@ def parse_text_directory(text: str) -> list:
                 if len(potential_street) > 3:
                     current_street = potential_street
                     break
-        
+
         # Parse address entries
         # Pattern: "4002 State Farm Insurance 385-3313" or "372 OASIS TREE FARM"
         addr_pattern = r'^(\d{3,5})[a-z]?\s+(.+?)(?:\s+\d{3}-\d{4})?$'
         addr_match = re.match(addr_pattern, line, re.IGNORECASE)
-        
+
         if addr_match and current_street:
             address_num = addr_match.group(1)
             occupant = addr_match.group(2).strip()
-            
+
             # Clean up occupant name
             occupant = re.sub(r'\s+\d{3}-\d{4}$', '', occupant)  # Remove phone
             occupant = re.sub(r'\s+$', '', occupant)  # Trim trailing spaces
-            
+
             # Skip if occupant is too short (likely parsing error)
             if len(occupant) < 2:
                 continue
-            
+
             records.append({
                 'ADDRESS': f"{address_num} {current_street}",
                 'LISTING': occupant,
                 'YEAR': int(current_year) if current_year else None
             })
-    
+
     return records
 
 def read_pdf_input(file) -> pd.DataFrame:
@@ -331,9 +354,9 @@ def read_pdf_input(file) -> pd.DataFrame:
     Extract city directory data from PDF (both text-based and scanned)
     """
     import pdfplumber
-    
+
     records = []
-    
+
     # Try text extraction first (for EDR-style PDFs)
     try:
         with pdfplumber.open(file) as pdf:
@@ -342,7 +365,7 @@ def read_pdf_input(file) -> pd.DataFrame:
                 page_text = page.extract_text()
                 if page_text and len(page_text.strip()) > 100:
                     text_content += page_text + "\n"
-            
+
             # If we got substantial text, parse it
             if len(text_content) > 500:
                 st.info("📄 Extracting text from PDF...")
@@ -354,11 +377,11 @@ def read_pdf_input(file) -> pd.DataFrame:
                     return df
     except Exception as e:
         st.warning(f"Text extraction failed: {e}")
-    
+
     # Fall back to OCR for scanned PDFs
     st.info("📸 This appears to be a scanned PDF. Using OCR to extract text...")
     st.caption("⏳ This may take 1-2 minutes depending on PDF size...")
-    
+
     try:
         import pytesseract
         from pdf2image import convert_from_bytes
@@ -367,10 +390,10 @@ def read_pdf_input(file) -> pd.DataFrame:
         st.error("❌ OCR libraries not installed. Please install: pytesseract, pdf2image, Pillow")
         st.info("💡 For text-based PDFs only, OCR is not required.")
         st.stop()
-    
+
     file.seek(0)  # Reset file pointer
     pdf_bytes = file.read()
-    
+
     # Convert PDF pages to images
     try:
         images = convert_from_bytes(pdf_bytes, dpi=300)
@@ -378,32 +401,32 @@ def read_pdf_input(file) -> pd.DataFrame:
         st.error(f"❌ Failed to convert PDF to images: {e}")
         st.info("💡 Make sure poppler-utils is installed on your system")
         st.stop()
-    
+
     all_text = ""
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
+
     for i, image in enumerate(images):
         status_text.text(f"Processing page {i + 1}/{len(images)}...")
-        
+
         # Preprocess image for better OCR
         image = preprocess_image_for_ocr(image)
-        
+
         # Extract text with OCR
         try:
             page_text = pytesseract.image_to_string(image, config='--psm 6')
             all_text += page_text + "\n"
         except Exception as e:
             st.warning(f"OCR failed on page {i + 1}: {e}")
-        
+
         progress_bar.progress((i + 1) / len(images))
-    
+
     progress_bar.empty()
     status_text.empty()
-    
+
     # Parse the OCR'd text
     records = parse_text_directory(all_text)
-    
+
     if not records:
         st.error("❌ Could not extract city directory data from PDF.")
         st.info("💡 **Troubleshooting:**\n"
@@ -411,11 +434,11 @@ def read_pdf_input(file) -> pd.DataFrame:
                 "- Check that text is readable (not too faded)\n"
                 "- Try converting PDF to Excel manually if OCR fails")
         st.stop()
-    
+
     df = pd.DataFrame(records)
     df['ADDRESS'] = df['ADDRESS'].apply(normalize_addr)
     st.success(f"✅ Extracted {len(records)} entries using OCR")
-    
+
     return df
 
 
@@ -444,12 +467,20 @@ def read_input(file) -> pd.DataFrame:
         if "ADDRESS" in row_vals and "YEAR" in row_vals:
             header_row = i
             break
-    
+
     # If not found, look for ADDRESS1 or COMPANY_NAME (other formats)
     if header_row is None:
         for i in range(min(50, len(raw))):
             row_vals = raw.iloc[i].astype(str).str.upper().tolist()
             if ("ADDRESS1" in row_vals or "COMPANY_NAME" in row_vals):
+                header_row = i
+                break
+
+    # If not found, look for TP/ADJ format (STREET NO + STREET NAME + OCCUPANT NAME)
+    if header_row is None:
+        for i in range(min(50, len(raw))):
+            row_vals = raw.iloc[i].astype(str).str.upper().tolist()
+            if "STREET NO" in row_vals and "STREET NAME" in row_vals:
                 header_row = i
                 break
 
@@ -474,28 +505,28 @@ def read_input(file) -> pd.DataFrame:
 
 def format_year_listing(df_addr: pd.DataFrame) -> pd.DataFrame:
     """Group by YEAR and combine listings into comma-separated unique string."""
-    
+
     # Check if YEAR column exists
     has_year = "YEAR" in df_addr.columns
-    
+
     if not has_year and "LISTING" not in df_addr.columns:
         return pd.DataFrame(columns=["Year(s)", "Occupant Listed"])
-    
+
     # Format WITHOUT year data
     if not has_year:
         t = df_addr[["LISTING"]].copy()
         t["LISTING"] = t["LISTING"].astype(str).str.strip()
         t = t[t["LISTING"].str.len() > 0]
-        
+
         # Remove duplicates
         unique_listings = t["LISTING"].drop_duplicates().tolist()
-        
+
         result = pd.DataFrame({
             "Year(s)": ["N/A"] * len(unique_listings),
             "Occupant Listed": unique_listings
         })
         return result
-    
+
     # Format WITH year data (original logic)
     if "LISTING" not in df_addr.columns:
         return pd.DataFrame(columns=["Year(s)", "Occupant Listed"])
@@ -541,7 +572,7 @@ def compress_year_runs(out_df: pd.DataFrame) -> list[tuple[str, str]]:
 
     years = out_df["Year(s)"].tolist()
     occs = out_df["Occupant Listed"].tolist()
-    
+
     # If no year data (all "N/A"), just return the listings
     if all(str(y) == "N/A" for y in years):
         return [(y, occ) for y, occ in zip(years, occs)]
@@ -660,13 +691,13 @@ def build_subject_report_docx(subject_selected: list[str], df: pd.DataFrame) -> 
 def build_adjoining_report_docx(adjoining_selected: list[str], df: pd.DataFrame, direction_map: dict) -> bytes:
     doc = Document()
     doc.add_paragraph("Addresses of adjoining properties were also reviewed. Historical tenants included:")
-    
+
     # Sort addresses by direction: N, NE, E, SE, S, SW, W, NW, then blank
     sorted_addresses = sorted(
         adjoining_selected,
         key=lambda addr: direction_sort_key(direction_map.get(addr, ""))
     )
-    
+
     # Group addresses by direction
     from collections import OrderedDict
     direction_groups = OrderedDict()
@@ -675,7 +706,7 @@ def build_adjoining_report_docx(adjoining_selected: list[str], df: pd.DataFrame,
         if direction not in direction_groups:
             direction_groups[direction] = []
         direction_groups[direction].append(addr)
-    
+
     # Create a table for each direction group
     for direction, addresses in direction_groups.items():
         # Add direction header
@@ -687,42 +718,42 @@ def build_adjoining_report_docx(adjoining_selected: list[str], df: pd.DataFrame,
             heading = doc.add_paragraph()
             heading.add_run("Direction: (Not Specified)").bold = True
             heading.style = 'Heading 2'
-        
+
         # Create table for this direction (2 columns: Address, Occupant)
         table = doc.add_table(rows=1, cols=2)
         table.style = "Table Grid"
         table.autofit = True
-        
+
         # Set column headers
         hdr = table.rows[0].cells
         hdr[0].text = "Adjoining Property Addresses"
         hdr[1].text = "Occupant Listed (Year)"
         set_table_header_style(table)
-        
+
         # Add rows for each address in this direction
         for addr in addresses:
             block = df[df["ADDRESS"] == addr].copy()
             out = format_year_listing(block)
             runs = compress_year_runs(out)
-            
+
             lines = []
             for year_label, occ in runs:
                 if occ:
                     lines.append(f"{occ} ({year_label})")
             occ_text = "\n".join(lines) if lines else "No results"
-            
+
             row = table.add_row().cells
             row[0].text = addr
             row[1].text = occ_text
-        
+
         # Add spacing after each table
         doc.add_paragraph()
-    
+
     return docx_bytes(doc)
 
 # ---------- Upload ----------
 uploaded = st.file_uploader(
-    "Upload City Directory export (CSV, XLSX, XLS, or PDF)", 
+    "Upload City Directory export (CSV, XLSX, XLS, or PDF)",
     type=["csv", "xlsx", "xls", "pdf"]
 )
 if not uploaded:
@@ -736,7 +767,7 @@ df = find_and_combine_address_columns(df)
 
 if "ADDRESS" not in df.columns:
     st.error("❌ Could not find an ADDRESS column. Available columns: " + ", ".join(df.columns))
-    st.info("Looking for: ADDRESS, ADDRESS1/ADDRESS2, STREET ADDRESS, PROPERTY ADDRESS, etc.")
+    st.info("Looking for: ADDRESS, ADDRESS1/ADDRESS2, STREET NO/STREET NAME, STREET ADDRESS, PROPERTY ADDRESS, etc.")
     st.stop()
 
 # Find and standardize listing/occupant column
@@ -744,12 +775,21 @@ df = find_listing_column(df)
 
 if "LISTING" not in df.columns:
     st.error("❌ Could not find a LISTING/COMPANY_NAME column. Available columns: " + ", ".join(df.columns))
-    st.info("Looking for: LISTING, COMPANY_NAME, FACILITY_ID, OCCUPANT, TENANT, etc.")
+    st.info("Looking for: LISTING, COMPANY_NAME, OCCUPANT NAME, FACILITY_ID, OCCUPANT, TENANT, etc.")
     st.stop()
 
 # Check if YEAR column exists and warn user
 if "YEAR" not in df.columns:
     st.warning("⚠️ No YEAR column found in this file. Results will show occupants without year information.")
+
+# Info message for TP/ADJ format
+if "TP/ADJ" in df.columns:
+    tp_count = (df["TP/ADJ"].str.upper() == "TP").sum()
+    adj_count = (df["TP/ADJ"].str.upper() == "ADJ").sum()
+    st.info(
+        f"ℹ️ TP/ADJ format detected — {tp_count:,} subject (TP) rows and {adj_count:,} adjoining (ADJ) rows found. "
+        f"Use the pickers below to select addresses as usual."
+    )
 
 # ✅ UPDATED SORTING: street name alpha, then house number numeric, then unit numeric
 all_addresses = [a for a in df["ADDRESS"].dropna().unique() if str(a).strip()]
@@ -835,7 +875,7 @@ with out_right:
         with st.expander("Optional: Set directions for adjoining addresses", expanded=False):
             # Updated direction options with diagonals
             dir_opts = ["", "North", "Northeast", "East", "Southeast", "South", "Southwest", "West", "Northwest"]
-            
+
             for a in adjoining_selected:
                 key = f"dir_{a}"
                 if a not in st.session_state["dir_map"]:
